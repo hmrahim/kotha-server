@@ -73,6 +73,7 @@ const initSocket = (server) => {
     })
 
     require('./controller/socketController')(io, socket, { isUserOnline })
+    require('./controller/callSocketController')(io, socket, { isUserOnline });
 
     socket.on('disconnect', async () => {
       console.log('❌ Socket disconnected:', socket.id)
