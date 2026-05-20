@@ -146,22 +146,21 @@ module.exports = (io, socket, { isUserOnline }) => {
         io.to(receiverId.toString()).emit('request_accepted')
       }
 
-      // ─── Push Notification — receiver offline থাকলে ──────────────────────
-      if (!receiverOnline) {
-        // Sender এর name এবং profile image আনো
+      // ─── Push Notification — সবসময় পাঠাও (online/offline দুটোতেই) ──────
+      {
         const sender = await User.findById(senderId).select('name photo')
         const senderName = sender?.name || 'New message'
         const senderAvatar = sender?.photo?.url || ''
 
         sendPushToUser(receiverId, {
-          title: senderName,                        // Sender এর নাম
-          body: preview || 'Sent you a message',    // Message preview
-          image: senderAvatar,                      // Sender এর profile image
+          title: senderName,
+          body: preview || 'Sent you a message',
+          image: senderAvatar,
           data: {
             chatId: chat._id.toString(),
             senderId: senderId.toString(),
-            senderName: senderName,                 // Navigate এর জন্য
-            senderAvatar: senderAvatar,             // Avatar দেখানোর জন্য
+            senderName,
+            senderAvatar,
             type: 'message',
           },
         })
@@ -349,8 +348,8 @@ module.exports = (io, socket, { isUserOnline }) => {
         io.to(toUserId.toString()).emit('request_accepted')
       }
 
-      // ─── Push Notification for forward ───────────────────────────────────
-      if (!receiverOnline) {
+      // ─── Push Notification for forward — সবসময় পাঠাও ──────────────────
+      {
         const sender = await User.findById(senderId).select('name photo')
         const senderName = sender?.name || 'New message'
         const senderAvatar = sender?.photo?.url || ''
@@ -362,8 +361,8 @@ module.exports = (io, socket, { isUserOnline }) => {
           data: {
             chatId: chat._id.toString(),
             senderId: senderId.toString(),
-            senderName: senderName,
-            senderAvatar: senderAvatar,
+            senderName,
+            senderAvatar,
             type: 'message',
           },
         })

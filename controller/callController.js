@@ -1,12 +1,8 @@
-
 const Call = require('../models/callSchema')
 const User = require('../models/userSchema')
 const { generateRtcToken, AGORA_APP_ID } = require('../services/agoraService')
 
 // POST /api/agora/token  body: { channelName, uid, role? }
-
-
-
 const getAgoraToken = async (req, res) => {
     try {
         const { channelName, uid, role } = req.body
@@ -21,7 +17,7 @@ const getAgoraToken = async (req, res) => {
     }
 }
 
-// GET /api/calls/history?page=1&limit=30
+// GET /api/calls/history?page=1&limit=30  (general history — call tab এর জন্য)
 const getCallHistory = async (req, res) => {
     try {
         const myId = req.user.id
@@ -67,6 +63,50 @@ const getCallHistory = async (req, res) => {
     }
 }
 
+// GET /api/calls/between/:otherId  — chat screen এ দুইজনের call history
+// Messages এর সাথে merge করার জন্য। createdAt দিয়ে sort করা।
+const getCallsBetween = async (req, res) => {
+    try {
+        const myId = req.user.id
+        const { otherId } = req.params
+
+        if (!otherId) return res.status(400).json({ error: 'otherId required' })
+
+        const calls = await Call.find({
+            $or: [
+                { callerId: myId,    calleeId: otherId },
+                { callerId: otherId, calleeId: myId    },
+            ],
+            // ringing/accepted স্তরে থেমে যাওয়া call দেখাবো না — শুধু সম্পূর্ণ হওয়া
+            status: { $in: ['ended', 'missed', 'rejected', 'canceled', 'timeout'] },
+        })
+            .sort({ createdAt: 1 })
+            .lean()
+
+        const formatted = calls.map((c) => {
+            const isOutgoing = c.callerId.toString() === myId.toString()
+            return {
+                _id:             c._id.toString(),
+                // message list এ mix করার জন্য type: 'call' দাও
+                itemType:        'call',
+                type:            c.type,       // voice | video
+                status:          c.status,     // ended | missed | rejected | canceled
+                isOutgoing,
+                durationSeconds: c.durationSeconds || 0,
+                startedAt:       c.startedAt,
+                createdAt:       c.createdAt,
+                // senderId দাও যাতে bubble এ isMe check করা যায়
+                senderId:        c.callerId.toString(),
+            }
+        })
+
+        return res.json({ data: formatted })
+    } catch (err) {
+        console.log('getCallsBetween error:', err.message)
+        return res.status(500).json({ error: err.message })
+    }
+}
+
 // DELETE /api/calls/history/:id
 const deleteCallEntry = async (req, res) => {
     try {
@@ -84,4 +124,4 @@ const deleteCallEntry = async (req, res) => {
     }
 }
 
-module.exports = { getAgoraToken, getCallHistory, deleteCallEntry, AGORA_APP_ID }
+module.exports = { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, AGORA_APP_ID }
