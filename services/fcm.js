@@ -3,56 +3,82 @@ const User = require("../models/userSchema");
 
 /**
  * Send push notification to a user (all their devices).
- * Notification এ sender এর name, image, message সব থাকবে।
+ *
+ * ✅ KEY DESIGN:
+ * - Regular message notification: notification + data (system tray এ দেখায়)
+ * - Incoming CALL notification: data-only (notification field নেই)
+ *   কারণ call এ app কে wake up করে full-screen UI দেখাতে হয়,
+ *   সেটা শুধু data-only message দিয়ে সম্ভব — notification field থাকলে
+ *   Android system নিজেই handle করে, app কে জানায় না।
  */
 const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
   try {
     if (!userId) return;
-    const user = await User.findById(userId).select("fcmTokens isOnline");
+    const user = await User.findById(userId).select("fcmTokens");
     if (!user || !user.fcmTokens || user.fcmTokens.length === 0) return;
-
-    // User online থাকলে push পাঠাবো না — socket এ পাচ্ছে
-    if (user.isOnline) return;
 
     const tokens = user.fcmTokens.filter(Boolean);
     if (tokens.length === 0) return;
 
-    const message = {
-      tokens,
-      notification: {
-        title: title || "New message",
-        body: body || "",
-        // Sender এর profile image notification এ দেখাবে
-        imageUrl: image || undefined,
-      },
-      data: Object.entries(data).reduce((acc, [k, v]) => {
-        acc[k] = typeof v === "string" ? v : JSON.stringify(v);
-        return acc;
-      }, {}),
-      android: {
-        priority: "high",
-        notification: {
-          channelId: "messages",
-          sound: "received",
-          // Android এ large icon হিসেবে sender এর image
-          imageUrl: image || undefined,
-        },
-      },
-      apns: {
-        headers: { "apns-priority": "10" },
-        payload: {
-          aps: {
-            sound: "received.mp3",
-            badge: 1,
-            "mutable-content": 1, // iOS এ image দেখাতে লাগে
+    const isCallNotification = data?.type === "incoming_call";
+
+    // ✅ FIX: Call notification — data-only
+    // data-only message এ Android background/killed state এ
+    // @react-native-firebase/messaging এর setBackgroundMessageHandler fire হয়
+    // সেখান থেকে Notifee দিয়ে full-screen call UI দেখানো হবে
+    const message = isCallNotification
+      ? {
+          tokens,
+          // ✅ notification field নেই — data-only
+          data: {
+            ...Object.entries(data).reduce((acc, [k, v]) => {
+              acc[k] = typeof v === "string" ? v : JSON.stringify(v);
+              return acc;
+            }, {}),
+            // Notifee এ দেখানোর জন্য title/body data এ রাখো
+            title: title || "Incoming Call",
+            body: body || "",
+            image: image || "",
           },
-        },
-        // iOS এ notification image
-        fcmOptions: {
-          imageUrl: image || undefined,
-        },
-      },
-    };
+          android: {
+            priority: "high",
+            // ✅ ttl: 30 seconds — call 35s timeout এর মধ্যে পৌঁছাতে হবে
+            ttl: 30000,
+            // ✅ data-only এ directBootOk — device restart এর পরেও আসে
+            directBootOk: true,
+          },
+        }
+      : {
+          // ✅ notification + data — Android system tray এ directly দেখায়
+          // background/killed দুটোতেই কাজ করে, setBackgroundMessageHandler এর দরকার নেই
+          tokens,
+          notification: {
+            title: title || "New message",
+            body:  body  || "",
+          },
+          data: Object.entries(data).reduce((acc, [k, v]) => {
+            acc[k] = typeof v === "string" ? v : JSON.stringify(v);
+            return acc;
+          }, {}),
+          android: {
+            priority: "high",
+            notification: {
+              channelId: "messages",
+              sound:     "received",
+              imageUrl:  image || undefined,
+            },
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                sound: "received.mp3",
+                badge: 1,
+                "mutable-content": 1,
+              },
+            },
+          },
+        };
 
     const res = await admin.messaging().sendEachForMulticast(message);
 
@@ -77,7 +103,10 @@ const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
       });
     }
 
-    console.log(`📲 Push sent to user ${userId} — success: ${res.successCount}, fail: ${res.failureCount}`);
+    console.log(
+      `📲 Push sent to user ${userId} [${isCallNotification ? "CALL" : "MSG"}]` +
+      ` — success: ${res.successCount}, fail: ${res.failureCount}`
+    );
   } catch (err) {
     console.log("FCM send error:", err.message);
   }

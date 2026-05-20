@@ -3,7 +3,7 @@ const { sendRequestController, getSentRequests, getReceivedRequests, acceptReque
 const { userPostController, getUser, getCurrentUser, getActiveUer, searchUserByEmail, updateProfile, registerFcmToken, removeFcmToken, blockUser, unblockUser, getBlockStatus } = require("../controller/userController");
 const { createStory, getStories, viewStory, replyStory, deleteStory, getStoryViews } = require("../controller/storyController");
 const authMiddleware = require("../middleware/authMiddleware");
-const { getAgoraToken, getCallHistory, deleteCallEntry } = require("../controller/callController");
+const { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry } = require("../controller/callController");
 
 
 const router = require("express").Router();
@@ -72,6 +72,8 @@ router.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 router.post("/agora/token", authMiddleware, getAgoraToken);
 router.get("/calls/history", authMiddleware, getCallHistory);
 router.delete("/calls/history/:id", authMiddleware, deleteCallEntry);
+// দুইজনের মধ্যে call history — chat screen এ messages এর সাথে merge করার জন্য
+router.get("/calls/between/:otherId", authMiddleware, getCallsBetween);
 
 
 module.exports = router;

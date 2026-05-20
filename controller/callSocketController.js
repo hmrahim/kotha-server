@@ -5,14 +5,37 @@ const { generateRtcToken } = require('../services/agoraService')
 const { sendPushToUser } = require('../services/fcm')
 
 const RING_TIMEOUT_MS = 35_000
-const activeTimeouts = new Map() // callId -> Timeout
+const activeTimeouts = new Map()
 
 const clearCallTimeout = (callId) => {
   const t = activeTimeouts.get(callId.toString())
   if (t) { clearTimeout(t); activeTimeouts.delete(callId.toString()) }
 }
 
-// ─── Stale call cleanup (app crash / disconnect হলে পুরনো call শেষ করে) ──────
+// ─── Helper: call শেষ হলে দুইজনকেই call:new_history emit করো ────────────────
+// Chat screen এ instant bubble দেখানোর জন্য। API refetch লাগবে না।
+const emitCallHistory = (io, call) => {
+  const item = {
+    _id:             call._id.toString(),
+    itemType:        'call',
+    type:            call.type,
+    status:          call.status,
+    durationSeconds: call.durationSeconds || 0,
+    startedAt:       call.startedAt,
+    createdAt:       call.createdAt || call.startedAt,
+    callerId:        call.callerId.toString(),
+    calleeId:        call.calleeId.toString(),
+    // senderId — caller এর id (bubble direction বোঝার জন্য)
+    senderId:        call.callerId.toString(),
+  }
+
+  // Caller কে পাঠাও — তার কাছে isOutgoing = true
+  io.to(call.callerId.toString()).emit('call:new_history', item)
+  // Callee কে পাঠাও — তার কাছে isOutgoing = false
+  io.to(call.calleeId.toString()).emit('call:new_history', item)
+}
+
+// ─── Stale call cleanup ───────────────────────────────────────────────────────
 const cleanupStaleCallsForUser = async (userId, io) => {
   try {
     const staleCalls = await Call.find({
@@ -22,25 +45,50 @@ const cleanupStaleCallsForUser = async (userId, io) => {
 
     for (const call of staleCalls) {
       clearCallTimeout(call._id)
-      call.status = 'ended'
-      call.endedAt = new Date()
-      if (call.acceptedAt) {
-        call.durationSeconds = Math.max(
-          0,
-          Math.floor((call.endedAt - call.acceptedAt) / 1000)
-        )
-      }
-      await call.save()
+      const endedAt = new Date()
+      const isCallerDisconnect = call.callerId.toString() === userId.toString()
 
-      // দুই পক্ষকে জানাও
-      io.to(call.callerId.toString()).emit('call:ended', {
-        callId: call._id.toString(),
-        durationSeconds: call.durationSeconds,
-      })
-      io.to(call.calleeId.toString()).emit('call:ended', {
-        callId: call._id.toString(),
-        durationSeconds: call.durationSeconds,
-      })
+      if (call.status === 'ringing') {
+        // ─── Ringing call ────────────────────────────────────────────────
+        // Caller disconnect করলে → canceled (সে নিজেই কাটলো)
+        // Callee disconnect করলে → missed (ও ধরলো না)
+        call.status = isCallerDisconnect ? 'canceled' : 'missed'
+        call.endedAt = endedAt
+        // duration নেই — call connect-ই হয়নি
+
+        await call.save()
+
+        // সঠিক socket event emit করো
+        if (call.status === 'canceled') {
+          io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
+          io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
+        } else {
+          // missed → timeout event দাও (caller কে জানাবে "no answer")
+          io.to(call.callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
+          io.to(call.calleeId.toString()).emit('call:timeout', { callId: call._id.toString() })
+        }
+      } else {
+        // ─── Accepted call (connected ছিল, তারপর disconnect) ───────────
+        call.status = 'ended'
+        call.endedAt = endedAt
+        if (call.acceptedAt) {
+          call.durationSeconds = Math.max(0, Math.floor((endedAt - call.acceptedAt) / 1000))
+        }
+
+        await call.save()
+
+        io.to(call.callerId.toString()).emit('call:ended', {
+          callId: call._id.toString(),
+          durationSeconds: call.durationSeconds,
+        })
+        io.to(call.calleeId.toString()).emit('call:ended', {
+          callId: call._id.toString(),
+          durationSeconds: call.durationSeconds,
+        })
+      }
+
+      // ✅ Instant history bubble — সব case এই সঠিক status সহ
+      emitCallHistory(io, call)
     }
 
     if (staleCalls.length > 0) {
@@ -54,12 +102,11 @@ const cleanupStaleCallsForUser = async (userId, io) => {
 module.exports = (io, socket, { isUserOnline }) => {
   const myUserId = socket.handshake.auth.userId
 
-  // ─── Socket disconnect হলে stuck calls clean করো ─────────────────────────
   socket.on('disconnect', async () => {
     await cleanupStaleCallsForUser(myUserId, io)
   })
 
-  // ─── Caller initiates a call ──────────────────────────────────────────────
+  // ─── Caller initiates ─────────────────────────────────────────────────────
   socket.on('call:initiate', async (payload, cb) => {
     try {
       const callerId = myUserId
@@ -67,60 +114,31 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (!callerId || !receiverId) return cb?.({ ok: false, error: 'Missing ids' })
       if (!['voice', 'video'].includes(type)) return cb?.({ ok: false, error: 'Invalid type' })
 
-      // Block check
       const [caller, callee] = await Promise.all([
         User.findById(callerId).select('name photo blockedUsers'),
         User.findById(receiverId).select('name photo blockedUsers fcmTokens isOnline'),
       ])
       if (!caller || !callee) return cb?.({ ok: false, error: 'User not found' })
-      if (callee.blockedUsers?.some((id) => id.toString() === callerId.toString())) {
+      if (callee.blockedUsers?.some((id) => id.toString() === callerId.toString()))
         return cb?.({ ok: false, error: 'blocked' })
-      }
-      if (caller.blockedUsers?.some((id) => id.toString() === receiverId.toString())) {
+      if (caller.blockedUsers?.some((id) => id.toString() === receiverId.toString()))
         return cb?.({ ok: false, error: 'blocked_by_you' })
-      }
 
-      // ─── Stale call cleanup — 2 মিনিটের বেশি পুরনো ringing call মুছে দাও ──
-      // caller এবং receiver উভয়ের stale ringing call পরিষ্কার করো
+      // Stale cleanup
       const staleThreshold = new Date(Date.now() - 2 * 60 * 1000)
       await Call.updateMany(
-        {
-          $or: [
-            { calleeId: receiverId }, { callerId: receiverId },
-            { calleeId: callerId },   { callerId: callerId },
-          ],
-          status: 'ringing',
-          startedAt: { $lt: staleThreshold },
-        },
+        { $or: [{ calleeId: receiverId }, { callerId: receiverId }, { calleeId: callerId }, { callerId: callerId }], status: 'ringing', startedAt: { $lt: staleThreshold } },
         { $set: { status: 'missed', endedAt: new Date() } }
       )
-
-      // 10+ মিনিট ধরে accepted কিন্তু শেষ হয়নি — app crash হলে এই call আটকে থাকে
       const acceptedStale = new Date(Date.now() - 10 * 60 * 1000)
       await Call.updateMany(
-        {
-          $or: [
-            { calleeId: receiverId }, { callerId: receiverId },
-            { calleeId: callerId },   { callerId: callerId },
-          ],
-          status: 'accepted',
-          acceptedAt: { $lt: acceptedStale },
-        },
+        { $or: [{ calleeId: receiverId }, { callerId: receiverId }, { calleeId: callerId }, { callerId: callerId }], status: 'accepted', acceptedAt: { $lt: acceptedStale } },
         { $set: { status: 'ended', endedAt: new Date() } }
       )
 
-      // Busy check — stale calls clean হওয়ার পরে check করো
-      const existing = await Call.findOne({
-        $or: [{ calleeId: receiverId }, { callerId: receiverId }],
-        status: { $in: ['ringing', 'accepted'] },
-      })
+      const existing = await Call.findOne({ $or: [{ calleeId: receiverId }, { callerId: receiverId }], status: { $in: ['ringing', 'accepted'] } })
       if (existing) return cb?.({ ok: false, error: 'busy' })
-
-      // Caller নিজেও কোনো active call এ আছে কিনা check করো
-      const callerBusy = await Call.findOne({
-        $or: [{ calleeId: callerId }, { callerId: callerId }],
-        status: { $in: ['ringing', 'accepted'] },
-      })
+      const callerBusy = await Call.findOne({ $or: [{ calleeId: callerId }, { callerId: callerId }], status: { $in: ['ringing', 'accepted'] } })
       if (callerBusy) return cb?.({ ok: false, error: 'caller_busy' })
 
       const agoraCallerUid = Math.floor(Math.random() * 1_000_000) + 1
@@ -132,10 +150,9 @@ module.exports = (io, socket, { isUserOnline }) => {
         channelName, agoraCallerUid, agoraCalleeUid, startedAt: new Date(),
       })
 
-      // Caller token
       const callerTok = generateRtcToken(channelName, agoraCallerUid)
+      const calleeTok = generateRtcToken(channelName, agoraCalleeUid)
 
-      // Notify callee
       io.to(receiverId.toString()).emit('call:incoming', {
         callId: call._id.toString(),
         callerId: callerId.toString(),
@@ -143,27 +160,30 @@ module.exports = (io, socket, { isUserOnline }) => {
         callerAvatar: caller.photo?.url || '',
         type,
         channelName,
+        calleeToken: calleeTok.token,
+        calleeUid: agoraCalleeUid,
+        appId: calleeTok.appId,
       })
 
-      // FCM push if callee offline
-      if (!isUserOnline(receiverId)) {
-        sendPushToUser(receiverId, {
-          title: caller.name || 'Incoming call',
-          body: type === 'video' ? '📹 Incoming video call' : '📞 Incoming voice call',
-          image: caller.photo?.url || '',
-          data: {
-            type: 'incoming_call',
-            callId: call._id.toString(),
-            callerId: callerId.toString(),
-            callerName: caller.name || '',
-            callerAvatar: caller.photo?.url || '',
-            callType: type,
-            channelName,
-          },
-        })
-      }
+      sendPushToUser(receiverId, {
+        title: caller.name || 'Incoming call',
+        body: type === 'video' ? '📹 Incoming video call' : '📞 Incoming voice call',
+        image: caller.photo?.url || '',
+        data: {
+          type: 'incoming_call',
+          callId: call._id.toString(),
+          callerId: callerId.toString(),
+          callerName: caller.name || '',
+          callerAvatar: caller.photo?.url || '',
+          callType: type,
+          channelName,
+          calleeToken: calleeTok.token,
+          calleeUid: String(agoraCalleeUid),
+          appId: calleeTok.appId,
+        },
+      })
 
-      // No-answer timeout
+      // No-answer timeout → missed → ✅ instant history
       const t = setTimeout(async () => {
         activeTimeouts.delete(call._id.toString())
         const fresh = await Call.findById(call._id)
@@ -173,6 +193,8 @@ module.exports = (io, socket, { isUserOnline }) => {
           await fresh.save()
           io.to(callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
           io.to(receiverId.toString()).emit('call:timeout', { callId: call._id.toString() })
+          // ✅ Instant history bubble for missed call
+          emitCallHistory(io, fresh)
         }
       }, RING_TIMEOUT_MS)
       activeTimeouts.set(call._id.toString(), t)
@@ -185,11 +207,7 @@ module.exports = (io, socket, { isUserOnline }) => {
         uid: agoraCallerUid,
         appId: callerTok.appId,
         type,
-        callee: {
-          _id: receiverId,
-          name: callee.name,
-          avatar: callee.photo?.url || '',
-        },
+        callee: { _id: receiverId, name: callee.name, avatar: callee.photo?.url || '' },
       })
     } catch (err) {
       console.error('call:initiate error', err)
@@ -202,21 +220,26 @@ module.exports = (io, socket, { isUserOnline }) => {
     try {
       const call = await Call.findById(callId)
       if (!call) return cb?.({ ok: false, error: 'Call not found' })
-      if (call.status !== 'ringing') return cb?.({ ok: false, error: 'Call not ringing' })
+      if (!['ringing', 'accepted'].includes(call.status)) return cb?.({ ok: false, error: 'Call not ringing' })
       if (call.calleeId.toString() !== myUserId.toString()) return cb?.({ ok: false, error: 'Not your call' })
 
       clearCallTimeout(callId)
-      call.status = 'accepted'
-      call.acceptedAt = new Date()
-      await call.save()
+      if (call.status === 'ringing') {
+        call.status = 'accepted'
+        call.acceptedAt = new Date()
+        await call.save()
+      }
 
       const calleeTok = generateRtcToken(call.channelName, call.agoraCalleeUid)
+      const callerTok = generateRtcToken(call.channelName, call.agoraCallerUid)
 
-      // Notify caller
       io.to(call.callerId.toString()).emit('call:accepted', {
         callId: call._id.toString(),
         channelName: call.channelName,
         type: call.type,
+        token: callerTok.token,
+        uid: call.agoraCallerUid,
+        appId: callerTok.appId,
       })
 
       return cb?.({
@@ -249,10 +272,13 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.callerId.toString()).emit('call:rejected', { callId: call._id.toString() })
       io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
       cb?.({ ok: true })
+
+      // ✅ Instant history bubble — rejected call
+      emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
 
-  // ─── Caller cancels before pickup ────────────────────────────────────────
+  // ─── Caller cancels ───────────────────────────────────────────────────────
   socket.on('call:cancel', async ({ callId }, cb) => {
     try {
       const call = await Call.findById(callId)
@@ -267,10 +293,13 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
       io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
       cb?.({ ok: true })
+
+      // ✅ Instant history bubble — canceled call
+      emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
 
-  // ─── Either party ends an active call ────────────────────────────────────
+  // ─── Either party ends ────────────────────────────────────────────────────
   socket.on('call:end', async ({ callId }, cb) => {
     try {
       const call = await Call.findById(callId)
@@ -290,6 +319,9 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.callerId.toString()).emit('call:ended', { callId: call._id.toString(), durationSeconds })
       io.to(call.calleeId.toString()).emit('call:ended', { callId: call._id.toString(), durationSeconds })
       cb?.({ ok: true, durationSeconds })
+
+      // ✅ Instant history bubble — ended call with duration
+      emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
 }
