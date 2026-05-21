@@ -8,6 +8,7 @@ const http = require("http");
 const connectDB = require("./config/database");
 const router = require("./routes/router");
 const { initSocket } = require("./socket");
+const { startPing } = require("./controller/Pingcontroller");
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -38,6 +39,7 @@ connectDB();
 
 server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
+  startPing()
 });
 
 module.exports = { app, server };

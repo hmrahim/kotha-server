@@ -4,6 +4,7 @@ const { userPostController, getUser, getCurrentUser, getActiveUer, searchUserByE
 const { createStory, getStories, viewStory, replyStory, deleteStory, getStoryViews } = require("../controller/storyController");
 const authMiddleware = require("../middleware/authMiddleware");
 const { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById } = require("../controller/callController");
+const { pingHandler } = require("../controller/Pingcontroller");
 
 
 const router = require("express").Router();
@@ -76,6 +77,11 @@ router.delete("/calls/history/:id", authMiddleware, deleteCallEntry);
 router.get("/calls/between/:otherId", authMiddleware, getCallsBetween);
 // ✅ Background/killed app থেকে Decline button press — auth নেই (socket unavailable)
 router.post("/calls/:callId/reject", rejectCallById);
+
+
+// ─── Health & Ping ────────────────────────────────────────────────────────────
+router.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
+router.get("/ping", pingHandler); // ✅ UptimeRobot বা browser থেকে health chec
 
 
 module.exports = router;
