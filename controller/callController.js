@@ -124,4 +124,62 @@ const deleteCallEntry = async (req, res) => {
     }
 }
 
-module.exports = { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, AGORA_APP_ID }
+// ─── POST /api/calls/:callId/reject ──────────────────────────────────────────
+// Auth নেই — app killed/background state এ notifee Decline button থেকে call হয়।
+// Socket unavailable তাই HTTP দিয়ে reject করতে হয়।
+// Security: callId একটি MongoDB ObjectId — guess করা প্র্যাকটিক্যালি impossible।
+const rejectCallById = async (req, res) => {
+    try {
+        const { callId } = req.params
+        if (!callId) return res.status(400).json({ error: 'callId required' })
+
+        const call = await Call.findById(callId)
+        if (!call) return res.status(404).json({ error: 'Call not found' })
+
+        // Already ended — idempotent response
+        if (call.status !== 'ringing') {
+            return res.json({ ok: true, already: call.status })
+        }
+
+        call.status = 'rejected'
+        call.endedAt = new Date()
+        await call.save()
+
+        // ✅ Socket দিয়ে caller কে instantly জানাও
+        try {
+            const { getIO } = require('../socket')
+            const io = getIO()
+
+            io.to(call.callerId.toString()).emit('call:rejected', { callId: call._id.toString() })
+            io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
+
+            // Chat screen এ instant call bubble দেখানোর জন্য
+            const historyItem = {
+                _id:             call._id.toString(),
+                itemType:        'call',
+                type:            call.type,
+                status:          'rejected',
+                durationSeconds: 0,
+                startedAt:       call.startedAt,
+                createdAt:       call.createdAt || call.startedAt,
+                callerId:        call.callerId.toString(),
+                calleeId:        call.calleeId.toString(),
+                senderId:        call.callerId.toString(),
+            }
+            io.to(call.callerId.toString()).emit('call:new_history', historyItem)
+            io.to(call.calleeId.toString()).emit('call:new_history', historyItem)
+
+            console.log(`📵 Call ${callId} rejected via HTTP (background decline)`)
+        } catch (socketErr) {
+            // Socket unavailable হলেও HTTP response সফল — caller timeout এ জানবে
+            console.warn('rejectCallById socket emit error:', socketErr?.message)
+        }
+
+        return res.json({ ok: true })
+    } catch (err) {
+        console.log('rejectCallById error:', err.message)
+        return res.status(500).json({ error: err.message })
+    }
+}
+
+module.exports = { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById, AGORA_APP_ID }
