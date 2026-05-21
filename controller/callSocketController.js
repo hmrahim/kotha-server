@@ -13,7 +13,6 @@ const clearCallTimeout = (callId) => {
 }
 
 // ─── Helper: call শেষ হলে দুইজনকেই call:new_history emit করো ────────────────
-// Chat screen এ instant bubble দেখানোর জন্য। API refetch লাগবে না।
 const emitCallHistory = (io, call) => {
   const item = {
     _id:             call._id.toString(),
@@ -25,13 +24,10 @@ const emitCallHistory = (io, call) => {
     createdAt:       call.createdAt || call.startedAt,
     callerId:        call.callerId.toString(),
     calleeId:        call.calleeId.toString(),
-    // senderId — caller এর id (bubble direction বোঝার জন্য)
     senderId:        call.callerId.toString(),
   }
 
-  // Caller কে পাঠাও — তার কাছে isOutgoing = true
   io.to(call.callerId.toString()).emit('call:new_history', item)
-  // Callee কে পাঠাও — তার কাছে isOutgoing = false
   io.to(call.calleeId.toString()).emit('call:new_history', item)
 }
 
@@ -44,51 +40,73 @@ const cleanupStaleCallsForUser = async (userId, io) => {
     })
 
     for (const call of staleCalls) {
-      clearCallTimeout(call._id)
       const endedAt = new Date()
       const isCallerDisconnect = call.callerId.toString() === userId.toString()
 
       if (call.status === 'ringing') {
-        // ─── Ringing call ────────────────────────────────────────────────
-        // Caller disconnect করলে → canceled (সে নিজেই কাটলো)
-        // Callee disconnect করলে → missed (ও ধরলো না)
-        call.status = isCallerDisconnect ? 'canceled' : 'missed'
-        call.endedAt = endedAt
-        // duration নেই — call connect-ই হয়নি
+        if (!isCallerDisconnect) {
+          // ✅ KEY FIX: Callee disconnect হলে missed করা যাবে না।
+          // FCM notification এখনো পৌঁছাতে পারে এবং user accept করতে পারে।
+          if (!activeTimeouts.has(call._id.toString())) {
+            const elapsed    = Date.now() - new Date(call.startedAt).getTime()
+            const remaining  = Math.max(0, RING_TIMEOUT_MS - elapsed)
 
+            if (remaining > 0) {
+              const t = setTimeout(async () => {
+                activeTimeouts.delete(call._id.toString())
+                const fresh = await Call.findById(call._id)
+                if (fresh && fresh.status === 'ringing') {
+                  fresh.status  = 'missed'
+                  fresh.endedAt = new Date()
+                  await fresh.save()
+                  io.to(fresh.callerId.toString()).emit('call:timeout', { callId: fresh._id.toString() })
+                  io.to(fresh.calleeId.toString()).emit('call:timeout', { callId: fresh._id.toString() })
+                  emitCallHistory(io, fresh)
+                }
+              }, remaining)
+              activeTimeouts.set(call._id.toString(), t)
+            } else {
+              call.status  = 'missed'
+              call.endedAt = endedAt
+              await call.save()
+              io.to(call.callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
+              io.to(call.calleeId.toString()).emit('call:timeout', { callId: call._id.toString() })
+              emitCallHistory(io, call)
+            }
+          }
+          continue
+        }
+
+        // Caller disconnect → canceled
+        clearCallTimeout(call._id)
+        call.status  = 'canceled'
+        call.endedAt = endedAt
         await call.save()
 
-        // সঠিক socket event emit করো
-        if (call.status === 'canceled') {
-          io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
-          io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
-        } else {
-          // missed → timeout event দাও (caller কে জানাবে "no answer")
-          io.to(call.callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
-          io.to(call.calleeId.toString()).emit('call:timeout', { callId: call._id.toString() })
-        }
+        io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
+        io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
+        emitCallHistory(io, call)
+
       } else {
-        // ─── Accepted call (connected ছিল, তারপর disconnect) ───────────
-        call.status = 'ended'
+        // Accepted call disconnect → ended
+        clearCallTimeout(call._id)
+        call.status  = 'ended'
         call.endedAt = endedAt
         if (call.acceptedAt) {
           call.durationSeconds = Math.max(0, Math.floor((endedAt - call.acceptedAt) / 1000))
         }
-
         await call.save()
 
         io.to(call.callerId.toString()).emit('call:ended', {
-          callId: call._id.toString(),
+          callId:          call._id.toString(),
           durationSeconds: call.durationSeconds,
         })
         io.to(call.calleeId.toString()).emit('call:ended', {
-          callId: call._id.toString(),
+          callId:          call._id.toString(),
           durationSeconds: call.durationSeconds,
         })
+        emitCallHistory(io, call)
       }
-
-      // ✅ Instant history bubble — সব case এই সঠিক status সহ
-      emitCallHistory(io, call)
     }
 
     if (staleCalls.length > 0) {
@@ -183,7 +201,7 @@ module.exports = (io, socket, { isUserOnline }) => {
         },
       })
 
-      // No-answer timeout → missed → ✅ instant history
+      // No-answer timeout → missed
       const t = setTimeout(async () => {
         activeTimeouts.delete(call._id.toString())
         const fresh = await Call.findById(call._id)
@@ -193,7 +211,6 @@ module.exports = (io, socket, { isUserOnline }) => {
           await fresh.save()
           io.to(callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
           io.to(receiverId.toString()).emit('call:timeout', { callId: call._id.toString() })
-          // ✅ Instant history bubble for missed call
           emitCallHistory(io, fresh)
         }
       }, RING_TIMEOUT_MS)
@@ -224,8 +241,15 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (call.calleeId.toString() !== myUserId.toString()) return cb?.({ ok: false, error: 'Not your call' })
 
       clearCallTimeout(callId)
+
+      // ✅ BUG FIX: acceptedAt null থাকলে duration সবসময় 0 হতো।
+      // আগে: status === 'ringing' হলেই save হতো, 'accepted' হলে save হতো না।
+      // এখন: যেকোনো ক্ষেত্রে acceptedAt null হলে set করো।
       if (call.status === 'ringing') {
-        call.status = 'accepted'
+        call.status     = 'accepted'
+        call.acceptedAt = new Date()
+        await call.save()
+      } else if (call.status === 'accepted' && !call.acceptedAt) {
         call.acceptedAt = new Date()
         await call.save()
       }
@@ -273,7 +297,6 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
       cb?.({ ok: true })
 
-      // ✅ Instant history bubble — rejected call
       emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
@@ -294,7 +317,6 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
       cb?.({ ok: true })
 
-      // ✅ Instant history bubble — canceled call
       emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
@@ -320,7 +342,6 @@ module.exports = (io, socket, { isUserOnline }) => {
       io.to(call.calleeId.toString()).emit('call:ended', { callId: call._id.toString(), durationSeconds })
       cb?.({ ok: true, durationSeconds })
 
-      // ✅ Instant history bubble — ended call with duration
       emitCallHistory(io, call)
     } catch (err) { cb?.({ ok: false, error: err.message }) }
   })
