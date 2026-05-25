@@ -1,37 +1,49 @@
-// Socket.IO signaling for Agora voice/video calls
+
 const Call = require('../models/callSchema')
 const User = require('../models/userSchema')
-const { generateRtcToken } = require('../services/agoraService')
 const { sendPushToUser } = require('../services/fcm')
 
 const RING_TIMEOUT_MS = 35_000
 const activeTimeouts = new Map()
+
+// ─── WebRTC readiness tracking per call ───────────────────────────────────────
+// callId => { caller: boolean, callee: boolean, buffer: [{event, payload, from}] }
+const webrtcReady = new Map()
+
+const ensureBucket = (callId) => {
+  const key = callId.toString()
+  if (!webrtcReady.has(key)) {
+    webrtcReady.set(key, { caller: false, callee: false, buffer: [] })
+  }
+  return webrtcReady.get(key)
+}
+
+const clearWebrtcBucket = (callId) => {
+  webrtcReady.delete(callId.toString())
+}
 
 const clearCallTimeout = (callId) => {
   const t = activeTimeouts.get(callId.toString())
   if (t) { clearTimeout(t); activeTimeouts.delete(callId.toString()) }
 }
 
-// ─── Helper: call শেষ হলে দুইজনকেই call:new_history emit করো ────────────────
 const emitCallHistory = (io, call) => {
   const item = {
-    _id:             call._id.toString(),
-    itemType:        'call',
-    type:            call.type,
-    status:          call.status,
+    _id: call._id.toString(),
+    itemType: 'call',
+    type: call.type,
+    status: call.status,
     durationSeconds: call.durationSeconds || 0,
-    startedAt:       call.startedAt,
-    createdAt:       call.createdAt || call.startedAt,
-    callerId:        call.callerId.toString(),
-    calleeId:        call.calleeId.toString(),
-    senderId:        call.callerId.toString(),
+    startedAt: call.startedAt,
+    createdAt: call.createdAt || call.startedAt,
+    callerId: call.callerId.toString(),
+    calleeId: call.calleeId.toString(),
+    senderId: call.callerId.toString(),
   }
-
   io.to(call.callerId.toString()).emit('call:new_history', item)
   io.to(call.calleeId.toString()).emit('call:new_history', item)
 }
 
-// ─── Stale call cleanup ───────────────────────────────────────────────────────
 const cleanupStaleCallsForUser = async (userId, io) => {
   try {
     const staleCalls = await Call.find({
@@ -44,73 +56,34 @@ const cleanupStaleCallsForUser = async (userId, io) => {
       const isCallerDisconnect = call.callerId.toString() === userId.toString()
 
       if (call.status === 'ringing') {
-        if (!isCallerDisconnect) {
-          // ✅ KEY FIX: Callee disconnect হলে missed করা যাবে না।
-          // FCM notification এখনো পৌঁছাতে পারে এবং user accept করতে পারে।
-          if (!activeTimeouts.has(call._id.toString())) {
-            const elapsed    = Date.now() - new Date(call.startedAt).getTime()
-            const remaining  = Math.max(0, RING_TIMEOUT_MS - elapsed)
-
-            if (remaining > 0) {
-              const t = setTimeout(async () => {
-                activeTimeouts.delete(call._id.toString())
-                const fresh = await Call.findById(call._id)
-                if (fresh && fresh.status === 'ringing') {
-                  fresh.status  = 'missed'
-                  fresh.endedAt = new Date()
-                  await fresh.save()
-                  io.to(fresh.callerId.toString()).emit('call:timeout', { callId: fresh._id.toString() })
-                  io.to(fresh.calleeId.toString()).emit('call:timeout', { callId: fresh._id.toString() })
-                  emitCallHistory(io, fresh)
-                }
-              }, remaining)
-              activeTimeouts.set(call._id.toString(), t)
-            } else {
-              call.status  = 'missed'
-              call.endedAt = endedAt
-              await call.save()
-              io.to(call.callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
-              io.to(call.calleeId.toString()).emit('call:timeout', { callId: call._id.toString() })
-              emitCallHistory(io, call)
-            }
-          }
-          continue
-        }
-
-        // Caller disconnect → canceled
+        if (!isCallerDisconnect) continue
         clearCallTimeout(call._id)
-        call.status  = 'canceled'
+        clearWebrtcBucket(call._id)
+        call.status = 'canceled'
         call.endedAt = endedAt
         await call.save()
-
         io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
         io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
         emitCallHistory(io, call)
-
       } else {
-        // Accepted call disconnect → ended
         clearCallTimeout(call._id)
-        call.status  = 'ended'
+        clearWebrtcBucket(call._id)
+        call.status = 'ended'
         call.endedAt = endedAt
         if (call.acceptedAt) {
           call.durationSeconds = Math.max(0, Math.floor((endedAt - call.acceptedAt) / 1000))
         }
         await call.save()
-
         io.to(call.callerId.toString()).emit('call:ended', {
-          callId:          call._id.toString(),
+          callId: call._id.toString(),
           durationSeconds: call.durationSeconds,
         })
         io.to(call.calleeId.toString()).emit('call:ended', {
-          callId:          call._id.toString(),
+          callId: call._id.toString(),
           durationSeconds: call.durationSeconds,
         })
         emitCallHistory(io, call)
       }
-    }
-
-    if (staleCalls.length > 0) {
-      console.log(`🧹 Cleaned ${staleCalls.length} stale call(s) for user ${userId}`)
     }
   } catch (err) {
     console.error('cleanupStaleCallsForUser error:', err.message)
@@ -142,7 +115,6 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (caller.blockedUsers?.some((id) => id.toString() === receiverId.toString()))
         return cb?.({ ok: false, error: 'blocked_by_you' })
 
-      // Stale cleanup
       const staleThreshold = new Date(Date.now() - 2 * 60 * 1000)
       await Call.updateMany(
         { $or: [{ calleeId: receiverId }, { callerId: receiverId }, { calleeId: callerId }, { callerId: callerId }], status: 'ringing', startedAt: { $lt: staleThreshold } },
@@ -159,17 +131,19 @@ module.exports = (io, socket, { isUserOnline }) => {
       const callerBusy = await Call.findOne({ $or: [{ calleeId: callerId }, { callerId: callerId }], status: { $in: ['ringing', 'accepted'] } })
       if (callerBusy) return cb?.({ ok: false, error: 'caller_busy' })
 
-      const agoraCallerUid = Math.floor(Math.random() * 1_000_000) + 1
-      const agoraCalleeUid = Math.floor(Math.random() * 1_000_000) + 1_000_001
-      const channelName = `call_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
+      const roomId = `call_${Date.now()}_${Math.floor(Math.random() * 1e6)}`
 
       const call = await Call.create({
-        callerId, calleeId: receiverId, type, status: 'ringing',
-        channelName, agoraCallerUid, agoraCalleeUid, startedAt: new Date(),
+        callerId,
+        calleeId: receiverId,
+        type,
+        status: 'ringing',
+        channelName: roomId,
+        startedAt: new Date(),
       })
 
-      const callerTok = generateRtcToken(channelName, agoraCallerUid)
-      const calleeTok = generateRtcToken(channelName, agoraCalleeUid)
+      // Initialize webrtc bucket for this call
+      ensureBucket(call._id)
 
       io.to(receiverId.toString()).emit('call:incoming', {
         callId: call._id.toString(),
@@ -177,10 +151,7 @@ module.exports = (io, socket, { isUserOnline }) => {
         callerName: caller.name,
         callerAvatar: caller.photo?.url || '',
         type,
-        channelName,
-        calleeToken: calleeTok.token,
-        calleeUid: agoraCalleeUid,
-        appId: calleeTok.appId,
+        roomId,
       })
 
       sendPushToUser(receiverId, {
@@ -194,14 +165,10 @@ module.exports = (io, socket, { isUserOnline }) => {
           callerName: caller.name || '',
           callerAvatar: caller.photo?.url || '',
           callType: type,
-          channelName,
-          calleeToken: calleeTok.token,
-          calleeUid: String(agoraCalleeUid),
-          appId: calleeTok.appId,
+          roomId,
         },
       })
 
-      // No-answer timeout → missed
       const t = setTimeout(async () => {
         activeTimeouts.delete(call._id.toString())
         const fresh = await Call.findById(call._id)
@@ -209,6 +176,7 @@ module.exports = (io, socket, { isUserOnline }) => {
           fresh.status = 'missed'
           fresh.endedAt = new Date()
           await fresh.save()
+          clearWebrtcBucket(fresh._id)
           io.to(callerId.toString()).emit('call:timeout', { callId: call._id.toString() })
           io.to(receiverId.toString()).emit('call:timeout', { callId: call._id.toString() })
           emitCallHistory(io, fresh)
@@ -219,10 +187,7 @@ module.exports = (io, socket, { isUserOnline }) => {
       return cb?.({
         ok: true,
         callId: call._id.toString(),
-        channelName,
-        token: callerTok.token,
-        uid: agoraCallerUid,
-        appId: callerTok.appId,
+        roomId,
         type,
         callee: { _id: receiverId, name: callee.name, avatar: callee.photo?.url || '' },
       })
@@ -242,11 +207,8 @@ module.exports = (io, socket, { isUserOnline }) => {
 
       clearCallTimeout(callId)
 
-      // ✅ BUG FIX: acceptedAt null থাকলে duration সবসময় 0 হতো।
-      // আগে: status === 'ringing' হলেই save হতো, 'accepted' হলে save হতো না।
-      // এখন: যেকোনো ক্ষেত্রে acceptedAt null হলে set করো।
       if (call.status === 'ringing') {
-        call.status     = 'accepted'
+        call.status = 'accepted'
         call.acceptedAt = new Date()
         await call.save()
       } else if (call.status === 'accepted' && !call.acceptedAt) {
@@ -254,31 +216,112 @@ module.exports = (io, socket, { isUserOnline }) => {
         await call.save()
       }
 
-      const calleeTok = generateRtcToken(call.channelName, call.agoraCalleeUid)
-      const callerTok = generateRtcToken(call.channelName, call.agoraCallerUid)
+      const caller = await User.findById(call.callerId).select('name photo')
 
       io.to(call.callerId.toString()).emit('call:accepted', {
         callId: call._id.toString(),
-        channelName: call.channelName,
+        roomId: call.channelName,
         type: call.type,
-        token: callerTok.token,
-        uid: call.agoraCallerUid,
-        appId: callerTok.appId,
       })
 
       return cb?.({
         ok: true,
         callId: call._id.toString(),
-        channelName: call.channelName,
-        token: calleeTok.token,
-        uid: call.agoraCalleeUid,
-        appId: calleeTok.appId,
+        roomId: call.channelName,
         type: call.type,
+        caller: {
+          _id: call.callerId.toString(),
+          name: caller?.name || 'User',
+          avatar: caller?.photo?.url || '',
+        },
       })
     } catch (err) {
       console.error('call:accept error', err)
       return cb?.({ ok: false, error: err.message })
     }
+  })
+
+  // ─── WebRTC: both sides emit when their PC is ready ──────────────────────
+  // ✅ FIX: Race-condition free signaling.
+  // Both caller and callee notify server when their RTCPeerConnection + media is ready.
+  // Server waits for BOTH then tells the caller to make the offer.
+  // Any buffered offer/answer/ice from earlier is flushed to the appropriate side.
+  socket.on('webrtc:ready', async ({ callId }, cb) => {
+    try {
+      const call = await Call.findById(callId)
+      if (!call) return cb?.({ ok: false, error: 'Call not found' })
+
+      const isCaller = call.callerId.toString() === myUserId.toString()
+      const isCallee = call.calleeId.toString() === myUserId.toString()
+      if (!isCaller && !isCallee) return cb?.({ ok: false, error: 'Not your call' })
+
+      const bucket = ensureBucket(callId)
+      if (isCaller) bucket.caller = true
+      if (isCallee) bucket.callee = true
+
+      console.log(`[WebRTC] ready — call ${callId} caller:${bucket.caller} callee:${bucket.callee}`)
+
+      // If BOTH ready → tell caller to send the offer
+      if (bucket.caller && bucket.callee) {
+        io.to(call.callerId.toString()).emit('webrtc:start_offer', { callId: call._id.toString() })
+
+        // Flush any buffered signals
+        if (bucket.buffer.length > 0) {
+          for (const { event, payload, toCaller } of bucket.buffer) {
+            const targetId = toCaller ? call.callerId.toString() : call.calleeId.toString()
+            io.to(targetId).emit(event, payload)
+          }
+          bucket.buffer = []
+        }
+      }
+
+      return cb?.({ ok: true })
+    } catch (err) {
+      console.error('webrtc:ready error', err)
+      return cb?.({ ok: false, error: err.message })
+    }
+  })
+
+  // ─── Offer/Answer/ICE — with buffering if peer not ready ─────────────────
+  const relayOrBuffer = async ({ callId, event, payload }) => {
+    const call = await Call.findById(callId)
+    if (!call) return { ok: false, error: 'Call not found' }
+
+    const isCaller = call.callerId.toString() === myUserId.toString()
+    const targetId = isCaller ? call.calleeId.toString() : call.callerId.toString()
+    const toCaller = !isCaller
+
+    const bucket = ensureBucket(callId)
+    const peerReady = toCaller ? bucket.caller : bucket.callee
+
+    if (peerReady) {
+      io.to(targetId).emit(event, payload)
+    } else {
+      bucket.buffer.push({ event, payload, toCaller })
+      console.log(`[WebRTC] buffered ${event} for call ${callId} (peer not ready)`)
+    }
+    return { ok: true }
+  }
+
+  socket.on('webrtc:offer', async ({ callId, offer }, cb) => {
+    try {
+      const r = await relayOrBuffer({ callId, event: 'webrtc:offer', payload: { callId, offer } })
+      return cb?.(r)
+    } catch (err) { return cb?.({ ok: false, error: err.message }) }
+  })
+
+  socket.on('webrtc:answer', async ({ callId, answer }, cb) => {
+    try {
+      const r = await relayOrBuffer({ callId, event: 'webrtc:answer', payload: { callId, answer } })
+      return cb?.(r)
+    } catch (err) { return cb?.({ ok: false, error: err.message }) }
+  })
+
+  socket.on('webrtc:ice-candidate', async ({ callId, candidate }, cb) => {
+    try {
+      const r = await relayOrBuffer({ callId, event: 'webrtc:ice-candidate', payload: { callId, candidate } })
+      return cb?.(r)
+    } catch (err) { return cb?.({ ok: false }) }
   })
 
   // ─── Callee rejects ───────────────────────────────────────────────────────
@@ -289,6 +332,7 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (call.status !== 'ringing') return cb?.({ ok: false, error: 'Already ended' })
 
       clearCallTimeout(callId)
+      clearWebrtcBucket(callId)
       call.status = 'rejected'
       call.endedAt = new Date()
       await call.save()
@@ -309,6 +353,7 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (!['ringing'].includes(call.status)) return cb?.({ ok: false, error: 'Cannot cancel' })
 
       clearCallTimeout(callId)
+      clearWebrtcBucket(callId)
       call.status = 'canceled'
       call.endedAt = new Date()
       await call.save()
@@ -329,6 +374,7 @@ module.exports = (io, socket, { isUserOnline }) => {
       if (!['accepted', 'ringing'].includes(call.status)) return cb?.({ ok: true })
 
       clearCallTimeout(callId)
+      clearWebrtcBucket(callId)
       const endedAt = new Date()
       const durationSeconds = call.acceptedAt
         ? Math.max(0, Math.floor((endedAt - call.acceptedAt) / 1000))
