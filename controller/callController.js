@@ -1,185 +1,159 @@
 const Call = require('../models/callSchema')
 const User = require('../models/userSchema')
-const { generateRtcToken, AGORA_APP_ID } = require('../services/agoraService')
 
-// POST /api/agora/token  body: { channelName, uid, role? }
-const getAgoraToken = async (req, res) => {
-    try {
-        const { channelName, uid, role } = req.body
-        if (!channelName || uid === undefined) {
-            return res.status(400).json({ error: 'channelName and uid required' })
-        }
-        const data = generateRtcToken(channelName, uid, role)
-        return res.json(data)
-    } catch (err) {
-        console.log('getAgoraToken error:', err.message)
-        return res.status(500).json({ error: err.message })
-    }
-}
-
-// GET /api/calls/history?page=1&limit=30  (general history — call tab এর জন্য)
+// GET /api/calls/history?page=1&limit=30
 const getCallHistory = async (req, res) => {
-    try {
-        const myId = req.user.id
-        const page = parseInt(req.query.page || '1', 10)
-        const limit = Math.min(parseInt(req.query.limit || '30', 10), 100)
-        const skip = (page - 1) * limit
+  try {
+    const myId  = req.user.id
+    const page  = parseInt(req.query.page  || '1',  10)
+    const limit = Math.min(parseInt(req.query.limit || '30', 10), 100)
+    const skip  = (page - 1) * limit
 
-        const calls = await Call.find({
-            $or: [{ callerId: myId }, { calleeId: myId }],
-        })
-            .sort({ createdAt: -1 })
-            .skip(skip)
-            .limit(limit)
-            .populate('callerId', 'name photo username')
-            .populate('calleeId', 'name photo username')
-            .lean()
+    const calls = await Call.find({
+      $or: [{ callerId: myId }, { calleeId: myId }],
+    })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(limit)
+      .populate('callerId', 'name photo username')
+      .populate('calleeId', 'name photo username')
+      .lean()
 
-        const formatted = calls.map((c) => {
-            const isOutgoing = c.callerId._id.toString() === myId.toString()
-            const other = isOutgoing ? c.calleeId : c.callerId
-            return {
-                _id: c._id,
-                type: c.type,
-                status: c.status,
-                isOutgoing,
-                durationSeconds: c.durationSeconds || 0,
-                startedAt: c.startedAt,
-                endedAt: c.endedAt,
-                createdAt: c.createdAt,
-                other: {
-                    _id: other?._id,
-                    name: other?.name,
-                    username: other?.username,
-                    photo: other?.photo?.url || '',
-                },
-            }
-        })
+    const formatted = calls.map((c) => {
+      const isOutgoing = c.callerId._id.toString() === myId.toString()
+      const other      = isOutgoing ? c.calleeId : c.callerId
+      return {
+        _id:             c._id,
+        type:            c.type,
+        status:          c.status,
+        isOutgoing,
+        durationSeconds: c.durationSeconds || 0,
+        startedAt:       c.startedAt,
+        endedAt:         c.endedAt,
+        createdAt:       c.createdAt,
+        other: {
+          _id:      other?._id,
+          name:     other?.name,
+          username: other?.username,
+          photo:    other?.photo?.url || '',
+        },
+      }
+    })
 
-        return res.json({ data: formatted, page, limit })
-    } catch (err) {
-        console.log('getCallHistory error:', err.message)
-        return res.status(500).json({ error: err.message })
-    }
+    return res.json({ data: formatted, page, limit })
+  } catch (err) {
+    console.log('getCallHistory error:', err.message)
+    return res.status(500).json({ error: err.message })
+  }
 }
 
-// GET /api/calls/between/:otherId  — chat screen এ দুইজনের call history
-// Messages এর সাথে merge করার জন্য। createdAt দিয়ে sort করা।
+// GET /api/calls/between/:otherId
 const getCallsBetween = async (req, res) => {
-    try {
-        const myId = req.user.id
-        const { otherId } = req.params
+  try {
+    const myId    = req.user.id
+    const { otherId } = req.params
+    if (!otherId) return res.status(400).json({ error: 'otherId required' })
 
-        if (!otherId) return res.status(400).json({ error: 'otherId required' })
+    const calls = await Call.find({
+      $or: [
+        { callerId: myId,    calleeId: otherId },
+        { callerId: otherId, calleeId: myId    },
+      ],
+      status: { $in: ['ended', 'missed', 'rejected', 'canceled', 'timeout'] },
+    })
+      .sort({ createdAt: 1 })
+      .lean()
 
-        const calls = await Call.find({
-            $or: [
-                { callerId: myId,    calleeId: otherId },
-                { callerId: otherId, calleeId: myId    },
-            ],
-            // ringing/accepted স্তরে থেমে যাওয়া call দেখাবো না — শুধু সম্পূর্ণ হওয়া
-            status: { $in: ['ended', 'missed', 'rejected', 'canceled', 'timeout'] },
-        })
-            .sort({ createdAt: 1 })
-            .lean()
+    const formatted = calls.map((c) => {
+      const isOutgoing = c.callerId.toString() === myId.toString()
+      return {
+        _id:             c._id.toString(),
+        itemType:        'call',
+        type:            c.type,
+        status:          c.status,
+        isOutgoing,
+        durationSeconds: c.durationSeconds || 0,
+        startedAt:       c.startedAt,
+        createdAt:       c.createdAt,
+        senderId:        c.callerId.toString(),
+      }
+    })
 
-        const formatted = calls.map((c) => {
-            const isOutgoing = c.callerId.toString() === myId.toString()
-            return {
-                _id:             c._id.toString(),
-                // message list এ mix করার জন্য type: 'call' দাও
-                itemType:        'call',
-                type:            c.type,       // voice | video
-                status:          c.status,     // ended | missed | rejected | canceled
-                isOutgoing,
-                durationSeconds: c.durationSeconds || 0,
-                startedAt:       c.startedAt,
-                createdAt:       c.createdAt,
-                // senderId দাও যাতে bubble এ isMe check করা যায়
-                senderId:        c.callerId.toString(),
-            }
-        })
-
-        return res.json({ data: formatted })
-    } catch (err) {
-        console.log('getCallsBetween error:', err.message)
-        return res.status(500).json({ error: err.message })
-    }
+    return res.json({ data: formatted })
+  } catch (err) {
+    console.log('getCallsBetween error:', err.message)
+    return res.status(500).json({ error: err.message })
+  }
 }
 
 // DELETE /api/calls/history/:id
 const deleteCallEntry = async (req, res) => {
-    try {
-        const myId = req.user.id
-        const { id } = req.params
-        const call = await Call.findById(id)
-        if (!call) return res.status(404).json({ error: 'Not found' })
-        if (call.callerId.toString() !== myId.toString() && call.calleeId.toString() !== myId.toString()) {
-            return res.status(403).json({ error: 'Forbidden' })
-        }
-        await Call.findByIdAndDelete(id)
-        return res.json({ ok: true })
-    } catch (err) {
-        return res.status(500).json({ error: err.message })
-    }
+  try {
+    const myId    = req.user.id
+    const { id }  = req.params
+    const call    = await Call.findById(id)
+    if (!call) return res.status(404).json({ error: 'Not found' })
+    if (
+      call.callerId.toString() !== myId.toString() &&
+      call.calleeId.toString() !== myId.toString()
+    ) return res.status(403).json({ error: 'Forbidden' })
+
+    await Call.findByIdAndDelete(id)
+    return res.json({ ok: true })
+  } catch (err) {
+    return res.status(500).json({ error: err.message })
+  }
 }
 
-// ─── POST /api/calls/:callId/reject ──────────────────────────────────────────
-// Auth নেই — app killed/background state এ notifee Decline button থেকে call হয়।
-// Socket unavailable তাই HTTP দিয়ে reject করতে হয়।
-// Security: callId একটি MongoDB ObjectId — guess করা প্র্যাকটিক্যালি impossible।
+// POST /api/calls/:callId/reject  (background decline — no auth)
 const rejectCallById = async (req, res) => {
-    try {
-        const { callId } = req.params
-        if (!callId) return res.status(400).json({ error: 'callId required' })
+  try {
+    const { callId } = req.params
+    if (!callId) return res.status(400).json({ error: 'callId required' })
 
-        const call = await Call.findById(callId)
-        if (!call) return res.status(404).json({ error: 'Call not found' })
+    const call = await Call.findById(callId)
+    if (!call) return res.status(404).json({ error: 'Call not found' })
 
-        // Already ended — idempotent response
-        if (call.status !== 'ringing') {
-            return res.json({ ok: true, already: call.status })
-        }
-
-        call.status = 'rejected'
-        call.endedAt = new Date()
-        await call.save()
-
-        // ✅ Socket দিয়ে caller কে instantly জানাও
-        try {
-            const { getIO } = require('../socket')
-            const io = getIO()
-
-            io.to(call.callerId.toString()).emit('call:rejected', { callId: call._id.toString() })
-            io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
-
-            // Chat screen এ instant call bubble দেখানোর জন্য
-            const historyItem = {
-                _id:             call._id.toString(),
-                itemType:        'call',
-                type:            call.type,
-                status:          'rejected',
-                durationSeconds: 0,
-                startedAt:       call.startedAt,
-                createdAt:       call.createdAt || call.startedAt,
-                callerId:        call.callerId.toString(),
-                calleeId:        call.calleeId.toString(),
-                senderId:        call.callerId.toString(),
-            }
-            io.to(call.callerId.toString()).emit('call:new_history', historyItem)
-            io.to(call.calleeId.toString()).emit('call:new_history', historyItem)
-
-            console.log(`📵 Call ${callId} rejected via HTTP (background decline)`)
-        } catch (socketErr) {
-            // Socket unavailable হলেও HTTP response সফল — caller timeout এ জানবে
-            console.warn('rejectCallById socket emit error:', socketErr?.message)
-        }
-
-        return res.json({ ok: true })
-    } catch (err) {
-        console.log('rejectCallById error:', err.message)
-        return res.status(500).json({ error: err.message })
+    if (call.status !== 'ringing') {
+      return res.json({ ok: true, already: call.status })
     }
+
+    call.status  = 'rejected'
+    call.endedAt = new Date()
+    await call.save()
+
+    try {
+      const { getIO } = require('../socket')
+      const io        = getIO()
+
+      io.to(call.callerId.toString()).emit('call:rejected', { callId: call._id.toString() })
+      io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
+
+      const historyItem = {
+        _id:             call._id.toString(),
+        itemType:        'call',
+        type:            call.type,
+        status:          'rejected',
+        durationSeconds: 0,
+        startedAt:       call.startedAt,
+        createdAt:       call.createdAt || call.startedAt,
+        callerId:        call.callerId.toString(),
+        calleeId:        call.calleeId.toString(),
+        senderId:        call.callerId.toString(),
+      }
+      io.to(call.callerId.toString()).emit('call:new_history', historyItem)
+      io.to(call.calleeId.toString()).emit('call:new_history', historyItem)
+
+      console.log(`📵 Call ${callId} rejected via HTTP`)
+    } catch (socketErr) {
+      console.warn('rejectCallById socket error:', socketErr?.message)
+    }
+
+    return res.json({ ok: true })
+  } catch (err) {
+    console.log('rejectCallById error:', err.message)
+    return res.status(500).json({ error: err.message })
+  }
 }
 
-module.exports = { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById, AGORA_APP_ID }
+module.exports = { getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById }

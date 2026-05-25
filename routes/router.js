@@ -3,7 +3,7 @@ const { sendRequestController, getSentRequests, getReceivedRequests, acceptReque
 const { userPostController, getUser, getCurrentUser, getActiveUer, searchUserByEmail, updateProfile, registerFcmToken, removeFcmToken, blockUser, unblockUser, getBlockStatus } = require("../controller/userController");
 const { createStory, getStories, viewStory, replyStory, deleteStory, getStoryViews } = require("../controller/storyController");
 const authMiddleware = require("../middleware/authMiddleware");
-const { getAgoraToken, getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById } = require("../controller/callController");
+const { getCallHistory, getCallsBetween, deleteCallEntry, rejectCallById } = require("../controller/callController");
 const { pingHandler } = require("../controller/Pingcontroller");
 
 
@@ -67,16 +67,20 @@ router.get("/chat-background/:receiverId", authMiddleware, getChatBackground);
 router.patch("/chat-background-by-receiver/:receiverId", authMiddleware, setChatBackgroundByReceiver);
 
 // Health check
-router.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
-
-// ─── Agora / Call ─────────────────────────────────────────────────────────────
-router.post("/agora/token", authMiddleware, getAgoraToken);
+// webRTC Call History
 router.get("/calls/history", authMiddleware, getCallHistory);
 router.delete("/calls/history/:id", authMiddleware, deleteCallEntry);
-// দুইজনের মধ্যে call history — chat screen এ messages এর সাথে merge করার জন্য
 router.get("/calls/between/:otherId", authMiddleware, getCallsBetween);
-// ✅ Background/killed app থেকে Decline button press — auth নেই (socket unavailable)
 router.post("/calls/:callId/reject", rejectCallById);
+
+
+
+
+
+
+
+
+
 
 
 // ─── Health & Ping ────────────────────────────────────────────────────────────
