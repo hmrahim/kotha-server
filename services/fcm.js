@@ -1,16 +1,6 @@
 const admin = require("../config/firebase");
 const User = require("../models/userSchema");
 
-/**
- * Send push notification to a user (all their devices).
- *
- * ✅ KEY DESIGN:
- * - Regular message notification: notification + data (system tray এ দেখায়)
- * - Incoming CALL notification: data-only (notification field নেই)
- *   কারণ call এ app কে wake up করে full-screen UI দেখাতে হয়,
- *   সেটা শুধু data-only message দিয়ে সম্ভব — notification field থাকলে
- *   Android system নিজেই handle করে, app কে জানায় না।
- */
 const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
   try {
     if (!userId) return;
@@ -22,51 +12,54 @@ const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
 
     const isCallNotification = data?.type === "incoming_call";
 
-    // ✅ FIX: Call notification — data-only
-    // data-only message এ Android background/killed state এ
-    // @react-native-firebase/messaging এর setBackgroundMessageHandler fire হয়
-    // সেখান থেকে Notifee দিয়ে full-screen call UI দেখানো হবে
+    // ✅ সব data value string এ convert করো (FCM requirement)
+    const stringData = Object.entries(data).reduce((acc, [k, v]) => {
+      acc[k] = typeof v === "string" ? v : JSON.stringify(v);
+      return acc;
+    }, {});
+
     const message = isCallNotification
       ? {
           tokens,
-          // ✅ notification field নেই — data-only
+          // ✅ Call: data-only — index.js background handler Notifee দিয়ে দেখাবে
+          // notification field নেই — Android system auto notification দেখাবে না
           data: {
-            ...Object.entries(data).reduce((acc, [k, v]) => {
-              acc[k] = typeof v === "string" ? v : JSON.stringify(v);
-              return acc;
-            }, {}),
-            // Notifee এ দেখানোর জন্য title/body data এ রাখো
+            ...stringData,
             title: title || "Incoming Call",
-            body: body || "",
+            body:  body  || "",
             image: image || "",
           },
           android: {
             priority: "high",
-            // ✅ ttl: 30 seconds — call 35s timeout এর মধ্যে পৌঁছাতে হবে
             ttl: 30000,
-            // ✅ data-only এ directBootOk — device restart এর পরেও আসে
             directBootOk: true,
+          },
+          apns: {
+            headers: { "apns-priority": "10" },
+            payload: {
+              aps: {
+                sound: "ringtone.mp3",
+                badge: 1,
+                "mutable-content": 1,
+                "content-available": 1,
+              },
+            },
           },
         }
       : {
-          // ✅ notification + data — Android system tray এ directly দেখায়
-          // background/killed দুটোতেই কাজ করে, setBackgroundMessageHandler এর দরকার নেই
+          // ✅ Message: data-only — index.js background handler Notifee দিয়ে দেখাবে
+          // notification field নেই — duplicate notification বন্ধ
           tokens,
-          notification: {
+          data: {
+            ...stringData,
             title: title || "New message",
             body:  body  || "",
+            image: image || "",
           },
-          data: Object.entries(data).reduce((acc, [k, v]) => {
-            acc[k] = typeof v === "string" ? v : JSON.stringify(v);
-            return acc;
-          }, {}),
           android: {
             priority: "high",
-            notification: {
-              channelId: "messages",
-              sound:     "received",
-              imageUrl:  image || undefined,
-            },
+            ttl: 86400000, // 24 hours
+            directBootOk: true,
           },
           apns: {
             headers: { "apns-priority": "10" },
@@ -75,6 +68,7 @@ const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
                 sound: "received.mp3",
                 badge: 1,
                 "mutable-content": 1,
+                "content-available": 1,
               },
             },
           },
@@ -94,6 +88,7 @@ const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
         ) {
           invalidTokens.push(tokens[idx]);
         }
+        console.warn(`[FCM] token ${idx} failed:`, r.error?.code);
       }
     });
 
