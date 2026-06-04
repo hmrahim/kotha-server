@@ -1,14 +1,49 @@
-const nodemailer = require("nodemailer");
+const https = require("https");
 
-const transporter = nodemailer.createTransport({
-  host: process.env.BREVO_SMTP_HOST,
-  port: process.env.BREVO_SMTP_PORT,
-  auth: {
-    user: process.env.BREVO_SMTP_USER,
-    pass: process.env.BREVO_SMTP_PASS,
-  },
-});
+// ─────────────────────────────────────────────────────────────────────────────
+// Brevo API helper
+// ─────────────────────────────────────────────────────────────────────────────
+const sendBrevoEmail = ({ to, toName, subject, htmlContent }) => {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({
+      sender: { name: "Kotha", email: "h.m.rahimnet@gmail.com" },
+      to: [{ email: to, name: toName }],
+      subject,
+      htmlContent,
+    });
 
+    const options = {
+      hostname: "api.brevo.com",
+      path: "/v3/smtp/email",
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": process.env.BREVO_API_KEY,
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve(data);
+        } else {
+          reject(new Error(`Brevo API error: ${res.statusCode} - ${data}`));
+        }
+      });
+    });
+
+    req.on("error", reject);
+    req.write(body);
+    req.end();
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OTP Email Template
+// ─────────────────────────────────────────────────────────────────────────────
 const buildOtpTemplate = (name, otp) => {
   const digits = otp.toString().split("");
   const year = new Date().getFullYear();
@@ -22,27 +57,18 @@ const buildOtpTemplate = (name, otp) => {
     </td>`;
 
   return `<!DOCTYPE html>
-<html lang="en" xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
+<html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <meta http-equiv="X-UA-Compatible" content="IE=edge"/>
-  <meta name="x-apple-disable-message-reformatting"/>
   <title>Verify your Kotha account</title>
   <style>
     * { box-sizing: border-box; }
-    body, table, td, a { -webkit-text-size-adjust: 100%; -ms-text-size-adjust: 100%; }
-    table, td { mso-table-lspace: 0pt; mso-table-rspace: 0pt; }
-    img { -ms-interpolation-mode: bicubic; border: 0; outline: none; text-decoration: none; }
     body { margin: 0 !important; padding: 0 !important; background-color: #0d0d14; width: 100% !important; }
-
     @media screen and (max-width: 600px) {
       .email-container { width: 100% !important; max-width: 100% !important; }
-      .fluid { width: 100% !important; max-width: 100% !important; }
       .pad { padding: 24px 20px !important; }
-      .pad-top { padding-top: 28px !important; }
       .header-pad { padding: 28px 20px 20px !important; }
-      .digit-box { width: 36px !important; height: 46px !important; line-height: 46px !important; font-size: 20px !important; }
       .otp-title { font-size: 22px !important; }
       .sub-text { font-size: 14px !important; }
       .brand-name { font-size: 24px !important; }
@@ -51,28 +77,16 @@ const buildOtpTemplate = (name, otp) => {
   </style>
 </head>
 <body style="margin:0;padding:0;background-color:#0d0d14;">
-
-<!-- Preview text -->
 <div style="display:none;font-size:1px;color:#0d0d14;line-height:1px;max-height:0px;max-width:0px;opacity:0;overflow:hidden;">
   ${otp} is your Kotha verification code — expires in 10 minutes.
 </div>
-
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color:#0d0d14;">
   <tr>
     <td align="center" style="padding:40px 16px;">
-
-      <!-- Email wrapper -->
       <table class="email-container" role="presentation" cellspacing="0" cellpadding="0" border="0" width="520" style="max-width:520px;width:100%;background-color:#13131f;border-radius:20px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);">
-
-        <!-- Top gradient bar -->
-        <tr>
-          <td style="height:4px;background:linear-gradient(90deg,#7c6af7,#a78bfa,#c084fc,#7c6af7);line-height:4px;font-size:4px;">&nbsp;</td>
-        </tr>
-
-        <!-- Header -->
+        <tr><td style="height:4px;background:linear-gradient(90deg,#7c6af7,#a78bfa,#c084fc,#7c6af7);line-height:4px;font-size:4px;">&nbsp;</td></tr>
         <tr>
           <td class="header-pad" align="center" style="padding:36px 40px 24px;">
-            <!-- Logo -->
             <div style="display:inline-block;width:60px;height:60px;border-radius:18px;background:linear-gradient(135deg,#7c6af7 0%,#c084fc 100%);line-height:60px;text-align:center;margin-bottom:14px;">
               <span style="font-size:26px;font-weight:900;color:#ffffff;font-family:Arial,sans-serif;">K</span>
             </div>
@@ -80,21 +94,8 @@ const buildOtpTemplate = (name, otp) => {
             <div style="font-family:Arial,sans-serif;font-size:11px;color:#5a5a7a;letter-spacing:3px;text-transform:uppercase;">Connect · Chat · Belong</div>
           </td>
         </tr>
-
-        <!-- Divider -->
-        <tr>
-          <td style="padding:0 32px;">
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
-              <tr><td style="height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.08),transparent);font-size:1px;line-height:1px;">&nbsp;</td></tr>
-            </table>
-          </td>
-        </tr>
-
-        <!-- Body -->
         <tr>
           <td class="pad" style="padding:32px 40px 24px;">
-
-            <!-- Badge -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" style="margin-bottom:16px;">
               <tr>
                 <td style="background:rgba(124,106,247,0.12);border-radius:20px;padding:5px 12px;">
@@ -102,42 +103,25 @@ const buildOtpTemplate = (name, otp) => {
                 </td>
               </tr>
             </table>
-
-            <!-- Heading -->
             <div class="otp-title" style="font-family:Arial,sans-serif;font-size:24px;font-weight:700;color:#f0f0ff;line-height:1.3;margin-bottom:12px;">
               Hey ${name}, you're almost in! 👋
             </div>
-
-            <!-- Subtext -->
             <div class="sub-text" style="font-family:Arial,sans-serif;font-size:15px;color:#8080a0;line-height:1.7;margin-bottom:28px;">
               Use the verification code below to confirm your email address and start connecting on Kotha.
             </div>
-
-            <!-- OTP Card -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:20px;">
               <tr>
                 <td style="background:linear-gradient(135deg,#1a1a2e,#1d1d33);border:1px solid rgba(124,106,247,0.2);border-radius:16px;padding:28px 20px;text-align:center;">
-
-                  <div style="font-family:Arial,sans-serif;font-size:11px;color:#5a5a7a;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:18px;font-weight:600;">
-                    Your Verification Code
-                  </div>
-
-                  <!-- OTP digits -->
+                  <div style="font-family:Arial,sans-serif;font-size:11px;color:#5a5a7a;letter-spacing:2.5px;text-transform:uppercase;margin-bottom:18px;font-weight:600;">Your Verification Code</div>
                   <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin:0 auto 18px;">
-                    <tr>
-                      ${digits.map((d, i) => digitBox(d, colors[i])).join("")}
-                    </tr>
+                    <tr>${digits.map((d, i) => digitBox(d, colors[i])).join("")}</tr>
                   </table>
-
                   <div style="font-family:Arial,sans-serif;font-size:12px;color:#5a5a7a;">
                     Full code: <strong style="color:#a78bfa;letter-spacing:3px;font-size:14px;">${otp}</strong>
                   </div>
-
                 </td>
               </tr>
             </table>
-
-            <!-- Info boxes -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="margin-bottom:12px;">
               <tr>
                 <td class="info-box" style="background:#1a1a2e;border-radius:10px;padding:13px 16px;">
@@ -152,7 +136,6 @@ const buildOtpTemplate = (name, otp) => {
                 </td>
               </tr>
             </table>
-
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
               <tr>
                 <td class="info-box" style="background:#180f0f;border:1px solid rgba(255,100,100,0.12);border-radius:10px;padding:13px 16px;">
@@ -167,20 +150,8 @@ const buildOtpTemplate = (name, otp) => {
                 </td>
               </tr>
             </table>
-
           </td>
         </tr>
-
-        <!-- Divider -->
-        <tr>
-          <td style="padding:0 32px;">
-            <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%">
-              <tr><td style="height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.08),transparent);font-size:1px;line-height:1px;">&nbsp;</td></tr>
-            </table>
-          </td>
-        </tr>
-
-        <!-- Footer -->
         <tr>
           <td align="center" style="padding:20px 32px 28px;">
             <div style="font-family:Arial,sans-serif;font-size:12px;color:#3a3a56;line-height:1.7;">
@@ -192,36 +163,39 @@ const buildOtpTemplate = (name, otp) => {
             </div>
           </td>
         </tr>
-
       </table>
-      <!-- /Email wrapper -->
-
     </td>
   </tr>
 </table>
-
 </body>
 </html>`;
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Send Verification Email
+// ─────────────────────────────────────────────────────────────────────────────
 exports.sendVerificationEmail = async (toEmail, name, otp) => {
-  await transporter.sendMail({
-    from: '"Kotha" <h.m.rahimnet@gmail.com>',
+  await sendBrevoEmail({
     to: toEmail,
+    toName: name,
     subject: `${otp} is your Kotha verification code`,
-    html: buildOtpTemplate(name, otp),
+    htmlContent: buildOtpTemplate(name, otp),
   });
 };
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Send Password Reset Link Email
+// ─────────────────────────────────────────────────────────────────────────────
 exports.sendPasswordResetEmail = async (toEmail, name, resetToken) => {
   const resetUrl = `${process.env.CLIENT_URL}/reset-password/${resetToken}`;
   const year = new Date().getFullYear();
-  await transporter.sendMail({
-    from: '"Kotha" <h.m.rahimnet@gmail.com>',
+
+  await sendBrevoEmail({
     to: toEmail,
+    toName: name,
     subject: "Reset your Kotha password",
-    html: `<!DOCTYPE html>
-<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+    htmlContent: `<!DOCTYPE html>
+<html lang="en">
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
@@ -279,13 +253,9 @@ exports.sendPasswordResetEmail = async (toEmail, name, resetToken) => {
   });
 };
 
-
-
 // ─────────────────────────────────────────────────────────────────────────────
-// emailService.js এ এই function টা ADD করো (নিচে paste করো)
-// পুরানো sendPasswordResetEmail রেখে দিতে পারো বা delete করতে পারো
+// Send Password Reset OTP Email
 // ─────────────────────────────────────────────────────────────────────────────
-
 exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
   const digits = otp.toString().split("");
   const year = new Date().getFullYear();
@@ -298,7 +268,11 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
       </div>
     </td>`;
 
-  const html = `<!DOCTYPE html>
+  await sendBrevoEmail({
+    to: toEmail,
+    toName: name,
+    subject: `${otp} — Kotha password reset code`,
+    htmlContent: `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8"/>
@@ -313,21 +287,15 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
   </style>
 </head>
 <body style="margin:0;padding:0;background-color:#0d0d14;">
-
 <div style="display:none;font-size:1px;color:#0d0d14;line-height:1px;max-height:0px;overflow:hidden;">
   ${otp} is your Kotha password reset code — expires in 10 minutes.
 </div>
-
 <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%" style="background-color:#0d0d14;">
   <tr>
     <td align="center" style="padding:40px 16px;">
       <table class="email-container" role="presentation" cellspacing="0" cellpadding="0" border="0" width="520"
         style="max-width:520px;width:100%;background-color:#13131f;border-radius:20px;overflow:hidden;border:1px solid rgba(255,255,255,0.07);">
-
-        <!-- Top bar -->
         <tr><td style="height:4px;background:linear-gradient(90deg,#7c6af7,#a78bfa,#c084fc,#7c6af7);line-height:4px;font-size:4px;">&nbsp;</td></tr>
-
-        <!-- Header -->
         <tr>
           <td align="center" style="padding:36px 40px 24px;">
             <div style="display:inline-block;width:60px;height:60px;border-radius:18px;background:linear-gradient(135deg,#7c6af7,#c084fc);line-height:60px;text-align:center;margin-bottom:14px;">
@@ -337,33 +305,20 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
             <div style="font-family:Arial,sans-serif;font-size:11px;color:#5a5a7a;letter-spacing:3px;text-transform:uppercase;">Connect · Chat · Belong</div>
           </td>
         </tr>
-
-        <!-- Body -->
         <tr>
           <td class="pad" style="padding:0 40px 36px;">
-
-            <!-- Icon -->
             <div style="text-align:center;margin-bottom:20px;">
               <div style="display:inline-block;width:64px;height:64px;border-radius:50%;background:rgba(124,106,247,0.15);border:1.5px solid rgba(124,106,247,0.3);line-height:64px;text-align:center;">
                 <span style="font-size:28px;">🔐</span>
               </div>
             </div>
-
-            <h2 style="font-family:Arial,sans-serif;font-size:22px;font-weight:800;color:#f0f0ff;text-align:center;margin:0 0 10px;">
-              Password Reset Code
-            </h2>
+            <h2 style="font-family:Arial,sans-serif;font-size:22px;font-weight:800;color:#f0f0ff;text-align:center;margin:0 0 10px;">Password Reset Code</h2>
             <p style="font-family:Arial,sans-serif;font-size:15px;color:#8888aa;text-align:center;margin:0 0 28px;line-height:22px;">
               হ্যালো ${name}, তোমার Kotha password reset করার জন্য নিচের OTP টি ব্যবহার করো।
             </p>
-
-            <!-- OTP digits -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" align="center" style="margin:0 auto 24px;">
-              <tr>
-                ${digits.map((d, i) => digitBox(d, colors[i])).join("")}
-              </tr>
+              <tr>${digits.map((d, i) => digitBox(d, colors[i])).join("")}</tr>
             </table>
-
-            <!-- Warning box -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
               style="background:rgba(248,81,73,0.08);border:1px solid rgba(248,81,73,0.2);border-radius:12px;margin-bottom:20px;">
               <tr>
@@ -374,8 +329,6 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
                 </td>
               </tr>
             </table>
-
-            <!-- Info box -->
             <table role="presentation" cellspacing="0" cellpadding="0" border="0" width="100%"
               style="background:#1a1a2e;border:1px solid rgba(255,255,255,0.06);border-radius:12px;">
               <tr>
@@ -386,11 +339,8 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
                 </td>
               </tr>
             </table>
-
           </td>
         </tr>
-
-        <!-- Footer -->
         <tr>
           <td style="padding:20px 40px;border-top:1px solid rgba(255,255,255,0.05);">
             <p style="font-family:Arial,sans-serif;font-size:12px;color:#3a3a5a;text-align:center;margin:0;">
@@ -398,18 +348,11 @@ exports.sendPasswordResetOtpEmail = async (toEmail, name, otp) => {
             </p>
           </td>
         </tr>
-
       </table>
     </td>
   </tr>
 </table>
 </body>
-</html>`;
-
-  await transporter.sendMail({
-    from: '"Kotha" <h.m.rahimnet@gmail.com>',
-    to: toEmail,
-    subject: `${otp} — Kotha password reset code`,
-    html,
+</html>`,
   });
 };
