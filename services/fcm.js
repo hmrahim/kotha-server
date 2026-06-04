@@ -1,110 +1,114 @@
-const admin = require("../config/firebase");
-const User = require("../models/userSchema");
+// services/fcm.js
+const User = require('../models/userSchema')
+
+let _admin = null
+
+const getAdmin = () => {
+  if (_admin) return _admin
+
+  const raw = process.env.GOOGLE_SERVICE_ACCOUNT_JSON
+  if (!raw) return null
+
+  try {
+    const firebaseAdmin = require('firebase-admin')
+    if (!firebaseAdmin.apps.length) {
+      firebaseAdmin.initializeApp({
+        credential: firebaseAdmin.credential.cert(JSON.parse(raw)),
+      })
+    }
+    _admin = firebaseAdmin
+    return _admin
+  } catch (err) {
+    console.error('[FCM] Firebase Admin init failed:', err.message)
+    return null
+  }
+}
 
 const sendPushToUser = async (userId, { title, body, image, data = {} }) => {
+  const admin = getAdmin()
+  if (!admin) return
+
   try {
-    if (!userId) return;
-    const user = await User.findById(userId).select("fcmTokens");
-    if (!user || !user.fcmTokens || user.fcmTokens.length === 0) return;
+    if (!userId) return
 
-    const tokens = user.fcmTokens.filter(Boolean);
-    if (tokens.length === 0) return;
+    const user = await User.findById(userId).select('fcmTokens')
+    if (!user?.fcmTokens?.length) return
 
-    const isCallNotification = data?.type === "incoming_call";
+    const tokens = user.fcmTokens.filter(Boolean)
+    if (!tokens.length) return
 
-    // ✅ সব data value string এ convert করো (FCM requirement)
-    const stringData = Object.entries(data).reduce((acc, [k, v]) => {
-      acc[k] = typeof v === "string" ? v : JSON.stringify(v);
-      return acc;
-    }, {});
+    const isCall = data?.type === 'incoming_call'
 
-    const message = isCallNotification
+    const stringData = Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, typeof v === 'string' ? v : JSON.stringify(v)])
+    )
+
+    const baseAndroid = {
+      priority: 'high',
+      ttl: isCall ? 45_000 : 86_400_000,
+      directBootOk: true,
+    }
+
+    const message = isCall
       ? {
           tokens,
-          // ✅ Call: data-only — index.js background handler Notifee দিয়ে দেখাবে
-          // notification field নেই — Android system auto notification দেখাবে না
           data: {
             ...stringData,
-            title: title || "Incoming Call",
-            body:  body  || "",
-            image: image || "",
+            title: title || 'Incoming Call',
+            body: body || '',
+            image: image || '',
           },
-          android: {
-            priority: "high",
-            ttl: 30000,
-            directBootOk: true,
-          },
+          android: baseAndroid,
           apns: {
-            headers: { "apns-priority": "10" },
+            headers: { 'apns-priority': '10', 'apns-push-type': 'alert' },
             payload: {
-              aps: {
-                sound: "ringtone.mp3",
-                badge: 1,
-                "mutable-content": 1,
-                "content-available": 1,
-              },
+              aps: { sound: 'ringtun.mp3', badge: 1, 'mutable-content': 1, 'content-available': 1 },
             },
           },
         }
       : {
-          // ✅ Message: data-only — index.js background handler Notifee দিয়ে দেখাবে
-          // notification field নেই — duplicate notification বন্ধ
           tokens,
+          notification: { title: title || 'New message', body: body || '' },
           data: {
             ...stringData,
-            title: title || "New message",
-            body:  body  || "",
-            image: image || "",
+            title: title || 'New message',
+            body: body || '',
+            image: image || '',
           },
           android: {
-            priority: "high",
-            ttl: 86400000, // 24 hours
-            directBootOk: true,
+            ...baseAndroid,
+            notification: { channelId: 'messages', sound: 'received' },
           },
           apns: {
-            headers: { "apns-priority": "10" },
+            headers: { 'apns-priority': '10' },
             payload: {
-              aps: {
-                sound: "received.mp3",
-                badge: 1,
-                "mutable-content": 1,
-                "content-available": 1,
-              },
+              aps: { sound: 'received.mp3', badge: 1, 'mutable-content': 1, 'content-available': 1 },
             },
           },
-        };
-
-    const res = await admin.messaging().sendEachForMulticast(message);
-
-    // Invalid token clean up
-    const invalidTokens = [];
-    res.responses.forEach((r, idx) => {
-      if (!r.success) {
-        const code = r.error?.code || "";
-        if (
-          code.includes("registration-token-not-registered") ||
-          code.includes("invalid-argument") ||
-          code.includes("invalid-registration-token")
-        ) {
-          invalidTokens.push(tokens[idx]);
         }
-        console.warn(`[FCM] token ${idx} failed:`, r.error?.code);
-      }
-    });
 
-    if (invalidTokens.length > 0) {
-      await User.findByIdAndUpdate(userId, {
-        $pull: { fcmTokens: { $in: invalidTokens } },
-      });
+    const res = await admin.messaging().sendEachForMulticast(message)
+
+    const invalid = res.responses
+      .map((r, i) => (!r.success && isInvalidTokenError(r.error?.code) ? tokens[i] : null))
+      .filter(Boolean)
+
+    if (invalid.length) {
+      await User.findByIdAndUpdate(userId, { $pull: { fcmTokens: { $in: invalid } } })
     }
 
     console.log(
-      `📲 Push sent to user ${userId} [${isCallNotification ? "CALL" : "MSG"}]` +
-      ` — success: ${res.successCount}, fail: ${res.failureCount}`
-    );
+      `📲 FCM → user ${userId} [${isCall ? 'CALL' : 'MSG'}]` +
+        ` ok:${res.successCount} fail:${res.failureCount}`
+    )
   } catch (err) {
-    console.log("FCM send error:", err.message);
+    console.error('[FCM] sendPushToUser error:', err.message)
   }
-};
+}
 
-module.exports = { sendPushToUser };
+const isInvalidTokenError = (code = '') =>
+  code.includes('registration-token-not-registered') ||
+  code.includes('invalid-registration-token') ||
+  code.includes('invalid-argument')
+
+module.exports = { sendPushToUser }

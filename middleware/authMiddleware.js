@@ -1,4 +1,4 @@
-const admin = require("../config/firebase");
+const jwt = require("jsonwebtoken");
 const User = require("../models/userSchema");
 
 const authMiddleware = async (req, res, next) => {
@@ -10,32 +10,35 @@ const authMiddleware = async (req, res, next) => {
     }
 
     const token = authHeader.split(" ")[1];
-    const decoded = await admin.auth().verifyIdToken(token);
-    const firebaseUid = decoded.uid;
+    
+    // ✅ JWT verification (Firebase remove করেছি)
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_ACCESS_SECRET || "your_access_secret_key"
+    );
 
-    let user = await User.findOne({ firebaseUid });
+    // ✅ User খুঁজুন MongoDB থেকে
+    const user = await User.findById(decoded.userId);
 
     if (!user) {
-      // ✅ username যোগ করা হয়েছে
-      user = await User.create({
-        name:        decoded.name         || "No Name",
-        username:    decoded.email?.split("@")[0] || firebaseUid, // ✅ email থেকে username বানাচ্ছি
-        email:       decoded.email        || "",
-        firebaseUid: firebaseUid,
-      })
+      return res.status(404).json({ message: "User not found" });
     }
 
     req.user = {
-      id:          user._id,
-      firebaseUid: firebaseUid,
-    }
+      id: user._id,
+      email: user.email,
+      name: user.name,
+    };
 
-    next()
+    next();
 
   } catch (error) {
-    console.log("Auth Error:", error.message) // ✅ পুরো error এর বদলে শুধু message
-    res.status(401).json({ message: "Unauthorized" })
+    console.log("Auth Error:", error.message);
+    if (error.name === "TokenExpiredError") {
+      return res.status(401).json({ message: "Token expired" });
+    }
+    res.status(401).json({ message: "Unauthorized" });
   }
-}
+};
 
-module.exports = authMiddleware
+module.exports = authMiddleware;
