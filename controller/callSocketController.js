@@ -56,14 +56,21 @@ const cleanupStaleCallsForUser = async (userId, io) => {
       const isCallerDisconnect = call.callerId.toString() === userId.toString()
 
       if (call.status === 'ringing') {
-        if (!isCallerDisconnect) continue
         clearCallTimeout(call._id)
         clearWebrtcBucket(call._id)
-        call.status = 'canceled'
         call.endedAt = endedAt
-        await call.save()
-        io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
-        io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
+
+        if (isCallerDisconnect) {
+          call.status = 'canceled'
+          await call.save()
+          io.to(call.callerId.toString()).emit('call:canceled', { callId: call._id.toString() })
+          io.to(call.calleeId.toString()).emit('call:canceled', { callId: call._id.toString() })
+        } else {
+          call.status = 'missed'
+          await call.save()
+          io.to(call.callerId.toString()).emit('call:rejected', { callId: call._id.toString() })
+          io.to(call.calleeId.toString()).emit('call:rejected', { callId: call._id.toString() })
+        }
         emitCallHistory(io, call)
       } else {
         clearCallTimeout(call._id)
@@ -218,6 +225,8 @@ module.exports = (io, socket, { isUserOnline }) => {
 
       const caller = await User.findById(call.callerId).select('name photo')
 
+      // ✅ FIX: Caller কে সাথে সাথে জানাও যে callee accept করেছে
+      // এতে caller তার call screen navigate শুরু করতে পারবে instantly
       io.to(call.callerId.toString()).emit('call:accepted', {
         callId: call._id.toString(),
         roomId: call.channelName,
@@ -323,6 +332,20 @@ module.exports = (io, socket, { isUserOnline }) => {
       return cb?.(r)
     } catch (err) { return cb?.({ ok: false }) }
   })
+
+  socket.on('webrtc:request-ice-restart', async ({ callId }, cb) => {
+    try {
+      const call = await Call.findById(callId)
+      if (!call) return cb?.({ ok: false, error: 'Call not found' })
+      const isCaller = call.callerId.toString() === myUserId.toString()
+      const targetId = isCaller ? call.calleeId.toString() : call.callerId.toString()
+      io.to(targetId).emit('webrtc:request-ice-restart', { callId })
+      return cb?.({ ok: true })
+    } catch (err) {
+      return cb?.({ ok: false, error: err.message })
+    }
+  })
+
 
   // ─── Callee rejects ───────────────────────────────────────────────────────
   socket.on('call:reject', async ({ callId }, cb) => {
