@@ -1,7 +1,42 @@
-
 const Call = require('../models/callSchema')
 const User = require('../models/userSchema')
 const { sendPushToUser } = require('../services/fcm')
+const { AccessToken } = require('livekit-server-sdk')
+
+const generateLiveKitToken = async (roomName, participantId, participantName) => {
+  // ✅ FIX: .env ফাইলে Windows CRLF থাকলে value এর শেষে stray \r থেকে যেতে পারে,
+  // যেটা key/secret কে corrupt করে দেয় আর LiveKit "invalid authorization token" দেয়।
+  // trim() দিয়ে সেই invisible whitespace/newline বাদ দিচ্ছি।
+  const apiKey = (process.env.LIVEKIT_API_KEY || 'devkey').trim();
+  const apiSecret = (process.env.LIVEKIT_API_SECRET || 'secret').trim();
+
+  if (apiKey === 'devkey' || apiSecret === 'secret') {
+    console.error('[LiveKit] ⚠️ WARNING: .env থেকে LIVEKIT_API_KEY/SECRET load হয়নি, fallback ব্যবহার হচ্ছে! Token invalid হবে।');
+  }
+  console.log('[LiveKit] Generating token with key:', apiKey.slice(0, 6) + '...', '| secret length:', apiSecret.length);
+  
+  const at = new AccessToken(apiKey, apiSecret, {
+    identity: participantId.toString(),
+    name: participantName || participantId.toString(),
+    ttl: 4 * 60 * 60, // 4 hours — লম্বা কল চলাকালীন reconnect হলেও token যেন expire না হয়
+  });
+  
+  at.addGrant({
+    roomJoin: true,
+    room: roomName,
+    canPublish: true,
+    canSubscribe: true,
+  });
+
+  // ✅ CRITICAL FIX: livekit-server-sdk v2+ এ at.toJwt() একটা Promise<string> রিটার্ন করে
+  // (jsonwebtoken lib এর বদলে jose ব্যবহার হচ্ছে বলে)। আগে এখানে "return at.toJwt()"
+  // ছিল যেটা await ছাড়া Promise অবজেক্টটাই রিটার্ন করত। socket.io এই Promise
+  // serialize করার সময় "{}" বানিয়ে ফেলত — client তাই আসল JWT না পেয়ে খালি {}
+  // পেত, আর LiveKit server তখন "invalid authorization token" error দিত।
+  // await দিয়ে এখন real JWT string রিটার্ন হবে।
+  const token = await at.toJwt();
+  return token;
+};
 
 const RING_TIMEOUT_MS = 35_000
 const activeTimeouts = new Map()
@@ -101,7 +136,15 @@ module.exports = (io, socket, { isUserOnline }) => {
   const myUserId = socket.handshake.auth.userId
 
   socket.on('disconnect', async () => {
-    await cleanupStaleCallsForUser(myUserId, io)
+    // 10-second grace period: prevents dropping ongoing calls when mobile network fluctuates or socket reconnects
+    setTimeout(async () => {
+      try {
+        if (!myUserId || isUserOnline(myUserId)) return
+        await cleanupStaleCallsForUser(myUserId, io)
+      } catch (e) {
+        console.warn('disconnect cleanup err:', e.message)
+      }
+    }, 10000)
   })
 
   // ─── Caller initiates ─────────────────────────────────────────────────────
@@ -191,12 +234,17 @@ module.exports = (io, socket, { isUserOnline }) => {
       }, RING_TIMEOUT_MS)
       activeTimeouts.set(call._id.toString(), t)
 
+      const livekitToken = await generateLiveKitToken(roomId, callerId, caller.name)
+      const livekitUrl = process.env.LIVEKIT_URL || ''
+
       return cb?.({
         ok: true,
         callId: call._id.toString(),
         roomId,
         type,
         callee: { _id: receiverId, name: callee.name, avatar: callee.photo?.url || '' },
+        livekitToken,
+        livekitUrl,
       })
     } catch (err) {
       console.error('call:initiate error', err)
@@ -223,7 +271,14 @@ module.exports = (io, socket, { isUserOnline }) => {
         await call.save()
       }
 
-      const caller = await User.findById(call.callerId).select('name photo')
+      const [caller, callee] = await Promise.all([
+        User.findById(call.callerId).select('name photo'),
+        User.findById(myUserId).select('name photo'),
+      ])
+
+      const livekitUrl = process.env.LIVEKIT_URL || ''
+      const callerToken = await generateLiveKitToken(call.channelName, call.callerId, caller?.name)
+      const calleeToken = await generateLiveKitToken(call.channelName, myUserId, callee?.name)
 
       // ✅ FIX: Caller কে সাথে সাথে জানাও যে callee accept করেছে
       // এতে caller তার call screen navigate শুরু করতে পারবে instantly
@@ -231,6 +286,8 @@ module.exports = (io, socket, { isUserOnline }) => {
         callId: call._id.toString(),
         roomId: call.channelName,
         type: call.type,
+        livekitToken: callerToken,
+        livekitUrl,
       })
 
       return cb?.({
@@ -243,6 +300,8 @@ module.exports = (io, socket, { isUserOnline }) => {
           name: caller?.name || 'User',
           avatar: caller?.photo?.url || '',
         },
+        livekitToken: calleeToken,
+        livekitUrl,
       })
     } catch (err) {
       console.error('call:accept error', err)
